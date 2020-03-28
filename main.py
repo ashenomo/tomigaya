@@ -24,8 +24,10 @@ from flask import Flask
 app = Flask(__name__)
 
 s = requests.Session()
-s.mount("http://", CachingHTTPAdapter())
-s.mount("https://", CachingHTTPAdapter())
+http_cache = CachingHTTPAdapter()
+https_cache = CachingHTTPAdapter()
+s.mount("http://", http_cache)
+s.mount("https://", https_cache)
 
 locale.setlocale(locale.LC_ALL, "ja_JP.UTF-8")
 
@@ -53,7 +55,7 @@ def ParseListingSummary(li) -> Listing:
 def FetchListingPage(host, listing: Listing) -> Optional[BeautifulSoup]:
   url = "%s%s" % (host, listing.link)
   print("Fetching %s" % url)
-  page = requests.get(url)
+  page = s.get(url)
   soup = BeautifulSoup(page.content, "html.parser")
   rooms_table = soup.find("div", class_="table_area scroll-area")
   if rooms_table:
@@ -175,9 +177,13 @@ class Scraper(object):
       body={'requests': reqs}).execute()
 
   def FetchAndParseListings(self, link: str):
+    print("http_cache size: %d, https_cache size: %d" % (
+      len(http_cache.cache._cache),
+      len(https_cache.cache._cache)
+    ))
     url = "https://%s%s" % (self.host, link)
     print("Fetching %s" % url)
-    page = requests.get(url)
+    page = s.get(url)
     soup = BeautifulSoup(page.content, "html.parser")
     rooms_table = soup.find("div", class_="table_area scroll-area")
     if rooms_table:
@@ -188,7 +194,7 @@ class Scraper(object):
       for unit_link in sorted(unit_links):
         unit_url = "https://%s%s" % (self.host, unit_link)
         print("Fetching unit page %s" % url)
-        unit_page = requests.get(unit_url)
+        unit_page = s.get(unit_url)
         yield ParseListingPage(unit_page, unit_link)
     else:
       yield ParseListingPage(page, link)
@@ -215,7 +221,7 @@ class Scraper(object):
   def Rescan(self):
     url = "https://" + self.host + self.path
     print("Hello, url: %s" % url)
-    page = requests.get(url)
+    page = s.get(url)
     soup = BeautifulSoup(page.content, "html.parser")
     ul = soup.find("ul", class_="new")
     if not ul:
