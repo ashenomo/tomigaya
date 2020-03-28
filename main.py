@@ -6,6 +6,8 @@ import os
 import re
 import sys
 import typing
+import sched
+import time
 
 import requests
 from bs4 import BeautifulSoup
@@ -24,10 +26,9 @@ from flask import Flask
 app = Flask(__name__)
 
 s = requests.Session()
-http_cache = CachingHTTPAdapter()
-https_cache = CachingHTTPAdapter()
+http_cache = CachingHTTPAdapter(capacity=1000)
 s.mount("http://", http_cache)
-s.mount("https://", https_cache)
+s.mount("https://", http_cache)
 
 locale.setlocale(locale.LC_ALL, "ja_JP.UTF-8")
 
@@ -48,7 +49,7 @@ def ParseListingSummary(li) -> Listing:
   link = li.find("a")["href"]
   # "background-image:url(/img/room00504273409720e_01t.jpg)">
   imgstyle = li.find("span", class_="img_area")["style"]
-  img = re.split("\(|\)", imgstyle)[1]
+  img = re.split(r"\(|\)", imgstyle)[1]
   return Listing(text=text, link=link, images=[img])
 
 
@@ -177,10 +178,7 @@ class Scraper(object):
       body={'requests': reqs}).execute()
 
   def FetchAndParseListings(self, link: str):
-    print("http_cache size: %d, https_cache size: %d" % (
-      len(http_cache.cache._cache),
-      len(https_cache.cache._cache)
-    ))
+    print("http_cache size: %d" % (len(http_cache.cache._cache)))
     url = "https://%s%s" % (self.host, link)
     print("Fetching %s" % url)
     page = s.get(url)
