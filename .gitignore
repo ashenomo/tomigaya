@@ -4,4 +4,5 @@ env
 venv
 .gcloudignore
 credentials.json
-token.jsonsendgrid.env
+token.json
+sendgrid.env
