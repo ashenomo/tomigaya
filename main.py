@@ -4,10 +4,12 @@ import datetime
 import locale
 import os
 import re
+import stat
+import shutil
 import sys
 import typing
-import sched
 import time
+import itertools
 
 import requests
 from bs4 import BeautifulSoup
@@ -21,24 +23,26 @@ from oauth2client import file, client, tools
 from typing import Any, List, Dict, Optional
 from flask import Flask
 
+from listing import Listing
+from listing import LISTING_FIELDS
+from fetcher import Fetcher
+from fetcher import ListingCache
+from emailer import Emailer
+from sheets import SheetsRenderer
+
 # If `entrypoint` is not defined in app.yaml, App Engine will look for an app
 # called `app` in `main.py`.
 app = Flask(__name__)
 
 s = requests.Session()
-http_cache = CachingHTTPAdapter(capacity=1000)
-s.mount("http://", http_cache)
-s.mount("https://", http_cache)
+#http_cache = CachingHTTPAdapter(capacity=1000)
+#s.mount("http://", http_cache)
+#s.mount("https://", http_cache)
 
 locale.setlocale(locale.LC_ALL, "ja_JP.UTF-8")
 
 SCOPES = "https://www.googleapis.com/auth/spreadsheets"
 SPREADSHEET_ID = "1KDESi_sl0COPlf3nKGeeNxXfH9j3BBpUq2mlaHZgKgo"
-
-LISTING_FIELDS = ["link", "text", "rent", "ldk", "msq", "address",
-                  "name", "roomnumber", "leaseterm", "year", "build", "images"]
-Listing = recordclass.recordclass("Listing", LISTING_FIELDS,
-                                  defaults=(None,) * len(LISTING_FIELDS))
 
 
 def ParseListingSummary(li) -> Listing:
@@ -51,71 +55,6 @@ def ParseListingSummary(li) -> Listing:
   imgstyle = li.find("span", class_="img_area")["style"]
   img = re.split(r"\(|\)", imgstyle)[1]
   return Listing(text=text, link=link, images=[img])
-
-
-def FetchListingPage(host, listing: Listing) -> Optional[BeautifulSoup]:
-  url = "%s%s" % (host, listing.link)
-  print("Fetching %s" % url)
-  page = s.get(url)
-  soup = BeautifulSoup(page.content, "html.parser")
-  rooms_table = soup.find("div", class_="table_area scroll-area")
-  if rooms_table:
-    print("Url %s is a property page, not yet supported" % url)
-    return None
-  return soup
-
-
-def NormalizeValue(value: str) -> str:
-  normalized = value.strip()
-  normalized = re.sub(r"[\s]+", " ", normalized)
-  return normalized
-
-
-class ParsedNumber(object):
-  def __init__(self, text: str, unit: str):
-    self.text = text
-    self.unit = unit
-    self.value = None
-    self.parsed = False
-    norm = text
-    if norm.endswith(unit):
-      norm = norm[:len(norm) - len(unit)]
-    try:
-      self.value = locale.atof(norm)
-      self.parsed = True
-    except ValueError:
-      pass
-
-  def __repr__(self):
-    if self.parsed:
-      return "[%f,%s]" % (self.value, self.unit)
-    return "[? %s]" % self.text
-
-
-def ParseListingPage(page, link: str) -> Listing:
-  soup = BeautifulSoup(page.content, "html.parser")
-  table = soup.find("table", summary="建物詳細")
-  details = collections.defaultdict(str)
-  for row in table.find_all("tr"):
-    key, value = row.find("th"), row.find("td")
-    if not key or not value:
-      continue
-    details[key.text] = NormalizeValue(value.find(text=True, recursive=False))
-  images = [e["href"] for e in soup.find_all("a", class_="sp-slide-fancy")]
-  print(details)
-  return Listing(
-    link=link,
-    roomnumber=details["部屋番号"],
-    ldk=details["間取り"],
-    name=details["物件名称"],
-    msq=ParsedNumber(details["専有面積"], "m²"),
-    rent=ParsedNumber(details["賃料"], "円"),
-    leaseterm=details["契約期間"],
-    address=details["所在地"],
-    images=images,
-    build=details["構造"],
-    year=details["築年月"],
-  )
 
 
 def IsInteresting(listing: Listing):
@@ -132,16 +71,22 @@ def IsInteresting(listing: Listing):
 
 
 class Scraper(object):
-  def __init__(self, host: str, path: str):
+  def __init__(self, host: str, path: str, rescan_secs=900):
     self.host = host
     self.path = path
-    store = file.Storage('token.json')
-    creds = store.get()
-    if not creds or creds.invalid:
-      flow = client.flow_from_clientsecrets('credentials.json', SCOPES)
-      creds = tools.run_flow(flow, store)
-    self.service = build('sheets', 'v4', http=creds.authorize(Http()))
+    self.renderer = SheetsRenderer(SPREADSHEET_ID)
+    self.rescan_secs = rescan_secs
+    self.fetcher: Fetcher = Fetcher(s, self.host)
+    self.listing_cache: ListingCache = ListingCache("/tmp/cache", self.fetcher)
+    self.emailer = Emailer(self.host, "/tmp/email_log")
+    # store = file.Storage('/tmp/token.json')
+    # creds = store.get()
+    # if not creds or creds.invalid:
+    #   flow = client.flow_from_clientsecrets('credentials.json', SCOPES)
+    #   creds = tools.run_flow(flow, store)
+    # self.service = build('sheets', 'v4', http=creds.authorize(Http()))
 
+  """
   def UpdateCellReq(self, row, col, contents: List[Dict[str, str]]) -> Dict[str, Any]:
     return {
       'updateCells': {
@@ -176,26 +121,7 @@ class Scraper(object):
     response = self.service.spreadsheets().batchUpdate(
       spreadsheetId=SPREADSHEET_ID,
       body={'requests': reqs}).execute()
-
-  def FetchAndParseListings(self, link: str):
-    print("http_cache size: %d" % (len(http_cache.cache._cache)))
-    url = "https://%s%s" % (self.host, link)
-    print("Fetching %s" % url)
-    page = s.get(url)
-    soup = BeautifulSoup(page.content, "html.parser")
-    rooms_table = soup.find("div", class_="table_area scroll-area")
-    if rooms_table:
-      unit_links = set()
-      for row in rooms_table.find_all("tr"):
-        a_elem = row.find_next("td").find("a")
-        unit_links.add(a_elem["href"])
-      for unit_link in sorted(unit_links):
-        unit_url = "https://%s%s" % (self.host, unit_link)
-        print("Fetching unit page %s" % url)
-        unit_page = s.get(unit_url)
-        yield ParseListingPage(unit_page, unit_link)
-    else:
-      yield ParseListingPage(page, link)
+  """
 
   def Render(self, listing: Listing) -> List[str]:
     n = lambda x: dict(numberValue=x)
@@ -218,7 +144,7 @@ class Scraper(object):
 
   def Rescan(self):
     url = "https://" + self.host + self.path
-    print("Hello, url: %s" % url)
+    print("Rescan triggered")
     page = s.get(url)
     soup = BeautifulSoup(page.content, "html.parser")
     ul = soup.find("ul", class_="new")
@@ -232,25 +158,35 @@ class Scraper(object):
     items = ul.find_all("li")
     summaries = [ParseListingSummary(item) for item in items]
     for summary in summaries:
-      for listing in self.FetchAndParseListings(summary.link):
+      for listing in self.listing_cache.FetchCached(summary.link):
         if IsInteresting(listing):
           tier1.append(listing)
         else:
           tier2.append(listing)
 
-    reqs = self.ClearSheetReqs()
-    reqs.append(self.UpdateCellReq(0, 0, [dict(stringValue=f) for f in LISTING_FIELDS]))
-    reqs.append(self.UpdateCellReq(0, 0, [dict(stringValue="%s 更新" % datetime.datetime.now()),dict(stringValue="")]))
+    reqs = self.renderer.ClearSheetReqs()
+    reqs.append(self.renderer.UpdateCellReq(0, 0, [dict(stringValue=f) for f in LISTING_FIELDS]))
+    reqs.append(self.renderer.UpdateCellReq(0, 0, [dict(stringValue="%s 更新" % datetime.datetime.now()),dict(stringValue="")]))
     row = 0
     for listing in tier1:
       row += 1
-      reqs.append(self.UpdateCellReq(row, 0, self.Render(listing)))
+      reqs.append(self.renderer.UpdateCellReq(row, 0, self.Render(listing)))
     row += 2
-    reqs.append(self.UpdateCellReq(row, 0, [dict(stringValue="以下ゴミ物件")]))
+    reqs.append(self.renderer.UpdateCellReq(row, 0, [dict(stringValue="以下ゴミ物件")]))
     for listing in tier2:
       row += 1
-      reqs.append(self.UpdateCellReq(row, 0, self.Render(listing)))
-    self.ExecuteReqs(reqs)
+      reqs.append(self.renderer.UpdateCellReq(row, 0, self.Render(listing)))
+    self.renderer.ExecuteReqs(reqs)
+    print("MaybeSend email for %d properties" % len(tier1))
+    self.emailer.MaybeSend(tier1)
+
+    print("Running id sanity check")
+    unique_ids = set()
+    for listing in itertools.chain(tier1, tier2):
+      id = listing.id()
+      unique_ids.add(id)
+    print("Num listings: %d, num unique ids: %d" % (len(tier1)+len(tier2), len(unique_ids)))
+
 
 
 @app.route('/')
@@ -258,7 +194,7 @@ def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--host", default="tomigaya.jp")
   parser.add_argument("--path", default="/feature/new")
-  args = parser.parse_args()
+  args, _ = parser.parse_known_args()
   print("cwd is: %s" % os.getcwd())
   # Rescan(args.host, args.path)
   scraper = Scraper(args.host, args.path)
