@@ -1,13 +1,32 @@
 import locale
 import re
 import recordclass
+import urllib.parse
 from typing import Any, Dict, Optional, Tuple
 
 
-LISTING_FIELDS = ["link", "text", "rent", "ldk", "msq", "address",
-                  "name", "roomnumber", "leaseterm", "year", "build", "images"]
+LISTING_FIELDS = [
+    "link",
+    "text",
+    "rent",
+    "ldk",
+    "msq",
+    "address",
+    "name",
+    "roomnumber",
+    "leaseterm",
+    "year",
+    "build",
+    "images",
+    "tier",
+]
 
-class Listing(recordclass.recordclass("Listing", LISTING_FIELDS, defaults=(None,) * len(LISTING_FIELDS))):
+
+class Listing(
+    recordclass.recordclass(
+        "Listing", LISTING_FIELDS, defaults=(None,) * len(LISTING_FIELDS)
+    )
+):
     def id(self):
         """Returns a presumed-unique id for the room in the form of (building id)___(room number)."""
         # /id/1234 or /id/1234/56
@@ -15,9 +34,29 @@ class Listing(recordclass.recordclass("Listing", LISTING_FIELDS, defaults=(None,
         if parts is None:
             return None
         building, room = parts
-        if room is not None and room != self.roomnumber:
-            print("ERROR: Link [%s] doesn't match room number [%s] in item [%s]" %(self.link, self.roomnumber, self))
+        if room is not None:
+            room = urllib.parse.unquote(room)
+            if room != self.roomnumber:
+                print(
+                    "ERROR: '%s' != '%s', Room number in link [%s] doesn't match room number in item [%s]"
+                    % (room, self.roomnumber, self.link, self)
+                )
         return "___".join([building, self.roomnumber])
+
+    def IsInteresting(self):
+        if self.msq.parsed and self.msq.value < 70:
+            return False
+        if "事務所" in self.ldk or "店舗" in self.ldk:
+            return False
+        if self.rent.parsed and self.rent.value > 400000:
+            return False
+        try:
+            year = int(self.year[:4])
+            if year < 1981 or (self.build == "木造" and year < 2001):
+                return False
+        except ValueError:
+            pass
+        return True
 
     @staticmethod
     def fromdict(dict_: Dict[str, Any]):
@@ -28,11 +67,12 @@ class Listing(recordclass.recordclass("Listing", LISTING_FIELDS, defaults=(None,
     def parselink(link: str) -> Optional[Tuple[str, Optional[str]]]:
         parts = link.split("/")
         if len(parts) < 3 or len(parts) > 5:
-            print("ERROR: Invalid link [%s]" %(link))
+            print("ERROR: Invalid link [%s]" % (link))
             return None
         if len(parts) == 3:
             return parts[2], None
         return parts[2], parts[3]
+
 
 def NormalizeValue(value: str) -> str:
     normalized = value.strip()
@@ -40,14 +80,18 @@ def NormalizeValue(value: str) -> str:
     return normalized
 
 
-class ParsedNumber(recordclass.recordclass("ParsedNumber", ["text", "unit", "value", "parsed"], [None, None, None, False])):
+class ParsedNumber(
+    recordclass.recordclass(
+        "ParsedNumber", ["text", "unit", "value", "parsed"], [None, None, None, False]
+    )
+):
     @staticmethod
-    def Parse(text:str, unit: str):
+    def Parse(text: str, unit: str):
         value = None
         parsed = False
         norm = text
         if norm.endswith(unit):
-            norm = norm[:len(norm) - len(unit)]
+            norm = norm[: len(norm) - len(unit)]
         try:
             value = locale.atof(norm)
             parsed = True

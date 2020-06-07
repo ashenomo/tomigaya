@@ -13,6 +13,8 @@ class Fetcher(object):
     def _ParseListingPage(self, page, link: str) -> Listing:
         soup = BeautifulSoup(page.content, "html.parser")
         table = soup.find("table", summary="建物詳細")
+        if not table:
+            return
         details = collections.defaultdict(str)
         for row in table.find_all("tr"):
             key, value = row.find("th"), row.find("td")
@@ -21,7 +23,7 @@ class Fetcher(object):
             details[key.text] = NormalizeValue(value.find(text=True, recursive=False))
         images = [e["href"] for e in soup.find_all("a", class_="sp-slide-fancy")]
         #print(details)
-        return Listing(
+        yield Listing(
             link=link,
             roomnumber=details["部屋番号"],
             ldk=details["間取り"],
@@ -36,16 +38,17 @@ class Fetcher(object):
         )
 
     def _ParseSerp(self, link, soup):
+        print("ParseSerp %s %s" % (link, soup))
         pass
 
 
     def Fetch(self, link):
-        url = "https://%s%s" % (self.host, link)
+        url = "http://%s%s" % (self.host, link)
         print("Fetching %s" % url)
         page = self.session.get(url)
         soup = BeautifulSoup(page.content, "html.parser")
         rooms_table = soup.find("div", class_="table_area scroll-area")
-        serp_list = soup.find("div", class_="w542-box")
+        serp_list = soup.find("div", class_="result_list")
         if serp_list:
             yield from self._ParseSerp(link, soup)
         if rooms_table:
@@ -54,12 +57,12 @@ class Fetcher(object):
                 a_elem = row.find_next("td").find("a")
                 unit_links.add(a_elem["href"])
             for unit_link in sorted(unit_links):
-                unit_url = "https://%s%s" % (self.host, unit_link)
+                unit_url = "http://%s%s" % (self.host, unit_link)
                 print("Fetching unit page %s" % url)
                 unit_page = self.session.get(unit_url)
-                yield self._ParseListingPage(unit_page, unit_link)
+                yield from self._ParseListingPage(unit_page, unit_link)
         else:
-            yield self._ParseListingPage(page, link)
+            yield from self._ParseListingPage(page, link)
 
 
 class ListingCache(object):
@@ -105,9 +108,21 @@ class ListingCache(object):
                 return [self._ReadRoomCached(id)]
 
         # Cache miss
-        listings = self.fetcher.Fetch(link)
+        listings = list(self.fetcher.Fetch(link))
         for listing in listings:
             self._WriteToCache(listing)
         print("Fetched %d items" % len(listings))
         self._Refresh()
         return listings
+
+
+def main():
+    cache = ListingCache("/tmp/cache-tomigaya.jp", None)
+    listing = cache._ReadRoomCached("2083463___戸建")
+    print(listing)
+    print("Year? %s" % listing.year)
+
+
+if __name__ == "__main__":
+    main()
+
