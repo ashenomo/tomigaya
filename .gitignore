@@ -1,8 +1,9 @@
+.gcloudignore
 .idea
 .vscode
-env
-venv
-.gcloudignore
+__pycache__
 credentials.json
-token.json
+env
 sendgrid.env
+token.json
+venv
