@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional, Tuple
 
 
 LISTING_FIELDS = [
+    "active",
+    "grentable",
     "link",
     "text",
     "rent",
@@ -18,7 +20,10 @@ LISTING_FIELDS = [
     "year",
     "build",
     "images",
-    "tier",
+    "firstseen",
+    "lastseen",
+    "seen_internal",  # To keep track of internal iteration during db update.
+    "written_internal",  # To keep track of listings written to sheet in first pass.
 ]
 
 
@@ -30,32 +35,45 @@ class Listing(
     def id(self):
         """Returns a presumed-unique id for the room in the form of (building id)___(room number)."""
         # /id/1234 or /id/1234/56
+        if not self.link:
+            print("ERROR: No link. %s" % self)
+            return None
         parts = Listing.parselink(self.link)
         if parts is None:
             return None
         building, room = parts
         if room is not None:
-            room = urllib.parse.unquote(room)
-            if room != self.roomnumber:
+            room = urllib.parse.unquote_plus(room)
+            if self.roomnumber is None:
+                self.roomnumber = room
+            elif room != self.roomnumber:
                 print(
                     "ERROR: '%s' != '%s', Room number in link [%s] doesn't match room number in item [%s]"
                     % (room, self.roomnumber, self.link, self)
                 )
         return "___".join([building, self.roomnumber])
 
-    def IsInteresting(self):
-        if self.msq.parsed and self.msq.value < 70:
-            return False
+    def PopulateDerived(self):
+        self.grentable = self.IsGrentable()
+
+    def IsGrentable(self):
         if "事務所" in self.ldk or "店舗" in self.ldk:
-            return False
-        if self.rent.parsed and self.rent.value > 400000:
             return False
         try:
             year = int(self.year[:4])
-            if year < 1981 or (self.build == "木造" and year < 2001):
+            if year < 1981 or ("木造" in self.build and year < 2001):
                 return False
         except ValueError:
             pass
+        return True
+
+    def IsInteresting(self):
+        if not self.IsGrentable():
+            return False
+        if self.msq.parsed and self.msq.value < 70:
+            return False
+        if self.rent.parsed and self.rent.value > 400000:
+            return False
         return True
 
     @staticmethod

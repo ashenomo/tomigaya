@@ -58,7 +58,7 @@ class Fetcher(object):
                 unit_links.add(a_elem["href"])
             for unit_link in sorted(unit_links):
                 unit_url = "http://%s%s" % (self.host, unit_link)
-                print("Fetching unit page %s" % url)
+                print("Fetching unit page %s" % unit_url)
                 unit_page = self.session.get(unit_url)
                 yield from self._ParseListingPage(unit_page, unit_link)
         else:
@@ -104,7 +104,7 @@ class ListingCache(object):
             return self._ReadBuildingCached(building)
         if room is not None:
             id = "___".join([building, room])
-            if id in self.ids():
+            if id in self.ids:
                 return [self._ReadRoomCached(id)]
 
         # Cache miss

@@ -1,40 +1,49 @@
 import argparse
 import collections
 import datetime
+import itertools
+import jsonpickle
 import locale
 import os
 import re
-import stat
 import shutil
+import stat
 import sys
-import typing
 import time
-import itertools
+import typing
+from collections import namedtuple
+from typing import Any, Dict, Generator, Iterable, List, Optional
 
+import recordclass as recordclass
 import requests
 from bs4 import BeautifulSoup
-from collections import namedtuple
-
-from httpcache import CachingHTTPAdapter
-import recordclass as recordclass
-from googleapiclient.discovery import build
-from httplib2 import Http
-from oauth2client import file, client, tools
-from typing import Any, List, Dict, Optional, Iterable, Generator
 from flask import Flask
+from googleapiclient.discovery import build
+from httpcache import CachingHTTPAdapter
+from httplib2 import Http
+from oauth2client import client, file, tools
+from requests.packages.urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
-from listing import Listing
-from listing import LISTING_FIELDS
-from fetcher import Fetcher
-from fetcher import ListingCache
 from emailer import Emailer
+from fetcher import Fetcher, ListingCache
+from listing import LISTING_FIELDS, Listing
 from sheets import SheetsRenderer
 
 # If `entrypoint` is not defined in app.yaml, App Engine will look for an app
 # called `app` in `main.py`.
 app = Flask(__name__)
 
+retry_strategy = Retry(
+    total=3,
+    status_forcelist=[429, 500, 502, 503, 504],
+    method_whitelist=["HEAD", "GET", "OPTIONS"]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
 s = requests.Session()
+s.mount("https://", adapter)
+s.mount("http://", adapter)
+
 #http_cache = CachingHTTPAdapter(capacity=1000)
 #s.mount("http://", http_cache)
 #s.mount("https://", http_cache)
@@ -43,6 +52,7 @@ locale.setlocale(locale.LC_ALL, "ja_JP.UTF-8")
 
 SCOPES = "https://www.googleapis.com/auth/spreadsheets"
 SPREADSHEET_ID = "1KDESi_sl0COPlf3nKGeeNxXfH9j3BBpUq2mlaHZgKgo"
+DB_SPREADSHEET_ID = "1mLyhK5IwUDfQlrEvZCYJwVAltG2Kuriy0olrT9mTwxQ"
 
 
 def ParseListingSummary(li) -> Listing:
@@ -58,39 +68,43 @@ def ParseListingSummary(li) -> Listing:
 
 
 class Scraper(object):
-  def __init__(self, host: str, path: str, rescan_secs=900):
+  def __init__(self, host: str, path: str, timestamp=datetime.datetime.now(), spreadsheet_id=SPREADSHEET_ID):
     self.host = host
     self.path = path
-    self.renderer = SheetsRenderer(SPREADSHEET_ID)
-    self.rescan_secs = rescan_secs
+    self.renderer = SheetsRenderer(spreadsheet_id)
     self.fetcher: Fetcher = Fetcher(s, self.host)
     self.listing_cache: ListingCache = ListingCache("/tmp/cache-%s" % host, self.fetcher)
     self.emailer = Emailer(self.host, "/tmp/email_log")
-    # store = file.Storage('/tmp/token.json')
-    # creds = store.get()
-    # if not creds or creds.invalid:
-    #   flow = client.flow_from_clientsecrets('credentials.json', SCOPES)
-    #   creds = tools.run_flow(flow, store)
-    # self.service = build('sheets', 'v4', http=creds.authorize(Http()))
+    self.timestamp = timestamp
 
-  def Render(self, listing: Listing) -> List[str]:
+  def Render(self, listing: Listing, fields=None) -> List[str]:
+    if not fields:
+      fields = LISTING_FIELDS
     n = lambda x: dict(numberValue=x)
     s = lambda x: dict(stringValue=x)
     f = lambda x: dict(formulaValue=x)
-    yield s("")
-    for field in LISTING_FIELDS:
+    for field in fields:
+      if field == "pickle":
+        yield s(jsonpickle.encode(listing))
+        continue
+      if field == "id":
+        yield s(listing.id())
+        continue
       value = getattr(listing, field)
-      if field == "link":
+      if value is None:
+        yield s("None")
+      elif field == "link":
         yield s("http://%s%s" % (self.host, value))
-      elif field in ["rent", "msq"]:
+      elif hasattr(value, "parsed"):
         yield n(value.value) if value.parsed else s(str(value))
       elif field == "address":
         yield f('=HYPERLINK("google.com/maps/place/%s", "%s")' % (value, value))
       elif field == "images":
         for imglink in value[:20]:
           yield f('=IMAGE("http://%s%s")' % (self.host, imglink))
+          break
       else:
-        yield s(value)
+        yield s(str(value))
 
   def GetSummariesFromFeaturePage(self, soup):
     ul = soup.find("ul", class_="new")
@@ -103,23 +117,22 @@ class Scraper(object):
     result_list = soup.find("div", class_="result_list")
     assert result_list
     for result in result_list.find_all("div", class_="base"):
-      link_a = result.find("a")
-      if not link_a:
-        print("No link in result: [%s]" % result)
-      assert link_a
-      link = link_a["href"]
-      yield Listing(link=link)
-      """
-      print("Link is %s" % link)
-      title_span = result.find("span", recursive=False, class_="room-title")
-      print("title_span: %s" % title_span)
-      title_strong = title_span.find("strong")
-      print("title_span: %s" % title_strong)
-      title = title_strong.text
-      print("title: %s" % title)
-      assert title
-      yield Listing(text=title, link=link_a["href"])
-      """
+      room_table = result.find("table", class_="room")
+      if room_table:
+        for row in room_table.find_all("tr", class_="clickableRow"):
+          match = re.match(r"location.href='(.*)';", row["onclick"])
+          if not match:
+            print("ERROR: invalid onclick string: [%s]" % row["onclick"])
+            continue
+          yield Listing(link=match.group(1))
+      else:
+        link_a = result.find("a")
+        if not link_a:
+          print("No link in result: [%s]" % result)
+        assert link_a
+        link = link_a["href"]
+        print("ERROR: No room table in result, falling back to building-level link [%s]" % link)
+        yield Listing(link=link)
     pager = soup.find("div", class_="pager")
     next_li = pager.find("li", class_="next")
     next_a = next_li.find("a")
@@ -132,25 +145,45 @@ class Scraper(object):
     next_soup = BeautifulSoup(page.content, "html.parser")
     yield from self.GetSummariesFromSerp(next_soup)
 
-  def Rescan(self) -> Generator[Listing, None, None]:
+  def FetchSummaries(self) -> List[Listing]:
     url = "http://" + self.host + self.path
     print("Rescan triggered for url %s" % url)
     page = s.get(url)
     soup = BeautifulSoup(page.content, "html.parser")
-    summaries = None
 
     feature_ul = soup.find("ul", class_="new")
     search_results = soup.find("div", class_="result_list")
     if feature_ul:
-      summaries = self.GetSummariesFromFeaturePage(soup)
+      return self.GetSummariesFromFeaturePage(soup)
     elif search_results:
-      summaries = self.GetSummariesFromSerp(soup)
-    else:
-      print("Unrecognized start page at %s" % url)
+      return self.GetSummariesFromSerp(soup)
+    raise ValueError("Unrecognized start page at %s" % url)
 
-    for summary in summaries:
+  def Rescan(self) -> Generator[Listing, None, None]:
+    for summary in self.FetchSummaries():
       for listing in self.listing_cache.FetchCached(summary.link):
         yield listing
+
+  def UpdateDb(self, db: Dict[str, Listing], counters):
+    for summary in self.FetchSummaries():
+      counters["total_active"] += 1
+      id = summary.id()
+      if id not in db.keys():
+        counters["new_rooms"] += 1
+        db[id] = self.listing_cache.FetchCached(summary.link)[0]
+        db[id].firstseen = self.timestamp
+      db[id].active = True
+      db[id].lastseen = self.timestamp
+      db[id].seen_internal = True
+
+    for id in db.keys():
+      db[id].PopulateDerived()
+      if not db[id].seen_internal:
+        if db[id].active:
+          counters["newly_inactive"] += 1
+        db[id].active = False
+        counters["total_inactive"] += 1
+    
 
   def RenderListings(self, listings: Iterable[Listing]):
     listing_dict = {l.id(): l for l in listings}
@@ -169,7 +202,7 @@ class Scraper(object):
         tier2.append(listing)
 
     reqs = self.renderer.ClearSheetReqs()
-    reqs.append(self.renderer.UpdateCellReq(0, 0, [dict(stringValue=f) for f in ["Notes"]+LISTING_FIELDS]))
+    reqs.append(self.renderer.UpdateCellReq(0, 0, [dict(stringValue=f) for f in ["Notes", "pickle"]+LISTING_FIELDS]))
     reqs.append(self.renderer.UpdateCellReq(0, 0, [dict(stringValue="%s 更新" % datetime.datetime.now()),dict(stringValue="")]))
     row = 0
     for listing in tier1:
@@ -226,16 +259,65 @@ def scrape_custom_path(host, subpath):
 
 @app.route('/crawl/<string:host>')
 def crawl_sitemap(host):
-  scraper = Scraper(host, "")
+  timestamp = datetime.datetime.now()
+  scraper = Scraper(host, "", timestamp)
   title = datetime.datetime.now().strftime('%m-%d %H:%M:%S') + " " + host + " crawl"
   listing_gens = []
   for link in scraper.ReadSiteMap():
     print("Crawling [%s]"%link)
-    sub_scraper = Scraper(host, link)
+    sub_scraper = Scraper(host, link, timestamp)
     listing_gens.append(sub_scraper.Rescan())
   scraper.renderer.CreateAndUseSheet(title)
   scraper.RenderListings(itertools.chain(*listing_gens))
   return "Done crawling"
+
+@app.route('/scrape-db/<string:host>/<path:subpath>')
+def scrape_and_update_db(host, subpath):
+  timestamp = datetime.datetime.now()
+  scraper = Scraper(host, ("/%s" % subpath), timestamp, DB_SPREADSHEET_ID)
+  counters = collections.defaultdict(int)
+  listing_headers = ["id"] + LISTING_FIELDS + ["pickle"]
+  if scraper.renderer.CreateAndUseSheet("%s%s db" % (host, subpath)):
+    counters["sheet_created"] += 1
+    init_reqs = [scraper.renderer.UpdateCellReq(0, 0, [dict(stringValue=f) for f in ["", "", ""]+listing_headers])]
+    scraper.renderer.ExecuteReqs(init_reqs)
+
+  db: Dict[str, Listing] = {l.id(): l for l in scraper.renderer.ReadPickleDb()}
+  scraper.UpdateDb(db, counters)
+  reqs = []
+  row = 1
+
+  id_col, id_col_num = scraper.renderer.FindColumn("id")
+  for id in scraper.renderer.ReadRange("%s2:%s" % (id_col, id_col), majorDimension="COLUMNS"):
+    if not id in db.keys():
+      counters["unknown_ids_in_sheet"] += 1
+      print("ERROR: id %s not in db" % id)
+      continue
+    reqs.append(scraper.renderer.UpdateCellReq(row, id_col_num, scraper.Render(db[id], listing_headers)))
+    counters["sheet_rows_updated"] += 1
+    db[id].written_internal = True
+    row += 1
+
+  for id in db.keys():
+    if db[id].written_internal:
+      continue
+    reqs.append(scraper.renderer.UpdateCellReq(row, id_col_num, scraper.Render(db[id], listing_headers)))
+    counters["sheet_rows_added"] += 1
+    db[id].written_internal = True
+    row += 1
+  
+  if scraper.renderer.CreateAndUseSheet("%s%s history" % (host, subpath)):
+    counters["sheet_created"] += 1
+    reqs.append(scraper.renderer.UpdateCellReq(0, 0, [dict(stringValue=f) for f in ["timestamp", "counters"]]))
+  row = 2
+  for value in scraper.renderer.ReadRange("A2:A", majorDimension="COLUMNS"):
+    row += 1
+    if not value:
+      break
+  reqs.append(scraper.renderer.UpdateCellReq(row, 0, [dict(stringValue=str(f)) for f in [timestamp, counters]]))
+  scraper.renderer.ExecuteReqs(reqs)
+  return "<pre>Done. Counters:\n%s</pre>" % "\n".join(["%30s %6d" % (k, v) for k, v in sorted(counters.items())])
+      
 
 if __name__ == '__main__':
     # This is used when running locally only. When deploying to Google App
