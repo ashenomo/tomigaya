@@ -37,7 +37,7 @@ recordclass==0.13.2
 regex==2020.2.20
 requests==2.23.0
 requests-cache==0.5.2
-rsa==4.0
+rsa==4.7
 sendgrid==6.2.0
 six==1.14.0
 soupsieve==2.0
